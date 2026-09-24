@@ -13,140 +13,270 @@ from datetime import datetime, timedelta
 import matplotlib.pyplot as plt
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 from matplotlib.collections import LineCollection
-import mysql.connector
-from mysql.connector import Error
+# Try MySQL; fall back to SQLite if unavailable
+try:
+    import mysql.connector
+    from mysql.connector import Error as MySQLError
+    MYSQL_AVAILABLE = True
+except ImportError:
+    MYSQL_AVAILABLE = False
+    MySQLError = Exception
+
+import sqlite3
 from collections import defaultdict, deque
 from sklearn.ensemble import IsolationForest
 import pandas as pd
 from scipy import stats
 
 class DatabaseManager:
-    def __init__(self, host='localhost', database='SpaceStationDetection', user='root', password=''):
+    """Database manager with MySQL primary and SQLite fallback."""
+
+    def __init__(self, host='localhost', database='SpaceStationDetection', user='root', password='root'):
         self.host = host
         self.database = database
         self.user = user
         self.password = password
         self.connection = None
-        
+        self.use_sqlite = False  # Will be set True if MySQL unavailable
+        self.sqlite_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'space_station.db')
+
+    # ------------------------------------------------------------------
+    # Connection helpers
+    # ------------------------------------------------------------------
+    def _init_sqlite_schema(self):
+        """Create SQLite tables if they don't exist."""
+        schema = """
+            CREATE TABLE IF NOT EXISTS schema_version (
+                version INTEGER PRIMARY KEY,
+                updated_at TEXT DEFAULT (datetime('now'))
+            );
+            CREATE TABLE IF NOT EXISTS detections (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp TEXT NOT NULL,
+                object_class TEXT NOT NULL,
+                confidence REAL NOT NULL,
+                x INTEGER NOT NULL,
+                y INTEGER NOT NULL,
+                width INTEGER NOT NULL,
+                height INTEGER NOT NULL,
+                image_path TEXT,
+                frame_width INTEGER,
+                frame_height INTEGER,
+                session_id TEXT
+            );
+            CREATE TABLE IF NOT EXISTS performance_metrics (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp TEXT NOT NULL,
+                fps REAL,
+                inference_time REAL,
+                accuracy REAL,
+                objects_detected INTEGER,
+                session_id TEXT
+            );
+            CREATE TABLE IF NOT EXISTS inventory (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp TEXT NOT NULL,
+                object_class TEXT NOT NULL,
+                count INTEGER NOT NULL,
+                avg_confidence REAL,
+                avg_x REAL,
+                avg_y REAL,
+                session_id TEXT
+            );
+            CREATE TABLE IF NOT EXISTS sessions (
+                session_id TEXT PRIMARY KEY,
+                start_time TEXT NOT NULL,
+                end_time TEXT,
+                duration REAL,
+                objects_detected INTEGER,
+                status TEXT
+            );
+            CREATE INDEX IF NOT EXISTS idx_detections_timestamp ON detections(timestamp);
+            CREATE INDEX IF NOT EXISTS idx_detections_class ON detections(object_class);
+            CREATE INDEX IF NOT EXISTS idx_perf_timestamp ON performance_metrics(timestamp);
+            CREATE INDEX IF NOT EXISTS idx_inv_timestamp ON inventory(timestamp);
+        """
+        conn = sqlite3.connect(self.sqlite_path)
+        conn.executescript(schema)
+        conn.close()
+
     def connect(self):
-        """Establish database connection"""
-        try:
-            self.connection = mysql.connector.connect(
-                host=self.host,
-                database=self.database,
-                user=self.user,
-                password="Agarwal",
-                autocommit=True
-            )
-            return True
-        except Error as e:
-            print(f"Database connection error: {e}")
-            return False
-    
-    def disconnect(self):
-        """Close database connection"""
-        if self.connection and self.connection.is_connected():
-            self.connection.close()
-    
-    def execute_query(self, query, params=None, fetch=False):
-        """Execute a database query"""
-        try:
-            if not self.connection or not self.connection.is_connected():
-                if not self.connect():
-                    return None
-            
-            cursor = self.connection.cursor(dictionary=True if fetch else False)
-            cursor.execute(query, params or ())
-            
-            if fetch:
-                result = cursor.fetchall()
-                cursor.close()
-                return result
-            else:
-                cursor.close()
+        """Try MySQL first; fall back to SQLite automatically."""
+        if MYSQL_AVAILABLE:
+            try:
+                self.connection = mysql.connector.connect(
+                    host=self.host,
+                    database=self.database,
+                    user=self.user,
+                    password=self.password,
+                    autocommit=True,
+                    connection_timeout=5
+                )
+                self.use_sqlite = False
+                print("Connected to MySQL database")
                 return True
-                
-        except Error as e:
+            except MySQLError as e:
+                print(f"MySQL unavailable ({e}), falling back to SQLite")
+
+        # SQLite fallback
+        self.use_sqlite = True
+        try:
+            self._init_sqlite_schema()
+            print(f"Using SQLite database at: {self.sqlite_path}")
+            return True
+        except Exception as e:
+            print(f"SQLite error: {e}")
+            return False
+
+    def disconnect(self):
+        """Close MySQL connection if open (SQLite is stateless per-query)."""
+        if not self.use_sqlite and self.connection:
+            try:
+                if self.connection.is_connected():
+                    self.connection.close()
+            except Exception:
+                pass
+
+    # ------------------------------------------------------------------
+    # Core query execution
+    # ------------------------------------------------------------------
+    def _adapt_query(self, query):
+        """Translate MySQL-specific syntax to SQLite-compatible SQL."""
+        import re
+        # Replace DATE_SUB(NOW(), INTERVAL ? DAY) with datetime('now', '-? days')
+        query = re.sub(
+            r"DATE_SUB\(NOW\(\),\s*INTERVAL\s*(\?|%s)\s*DAY\)",
+            "datetime('now', '-' || ? || ' days')",
+            query, flags=re.IGNORECASE
+        )
+        # Replace DATE_FORMAT(col, ...) with strftime equivalent (simplify to date)
+        query = re.sub(
+            r"DATE_FORMAT\(timestamp,\s*'%%Y-%%m-%%d %%H:00'\)",
+            "strftime('%Y-%m-%d %H:00', timestamp)",
+            query, flags=re.IGNORECASE
+        )
+        # Replace DATE(col) with date(col)
+        query = re.sub(r"\bDATE\(", "date(", query, flags=re.IGNORECASE)
+        # Replace %s placeholder with ?
+        query = query.replace('%s', '?')
+        return query
+
+    def execute_query(self, query, params=None, fetch=False):
+        """Execute a query against whichever backend is active."""
+        params = params or ()
+        try:
+            if self.use_sqlite:
+                adapted = self._adapt_query(query)
+                conn = sqlite3.connect(self.sqlite_path)
+                conn.row_factory = sqlite3.Row
+                cur = conn.cursor()
+                cur.execute(adapted, params)
+                if fetch:
+                    rows = cur.fetchall()
+                    result = [dict(r) for r in rows]
+                    conn.commit()
+                    conn.close()
+                    return result
+                else:
+                    conn.commit()
+                    conn.close()
+                    return True
+            else:
+                # MySQL path
+                if not self.connection or not self.connection.is_connected():
+                    if not self.connect():
+                        return None
+                cursor = self.connection.cursor(dictionary=True if fetch else False)
+                cursor.execute(query, params)
+                if fetch:
+                    result = cursor.fetchall()
+                    cursor.close()
+                    return result
+                else:
+                    cursor.close()
+                    return True
+        except Exception as e:
             print(f"Database query error: {e}")
             return None
-    
-    def insert_detection(self, timestamp, object_class, confidence, x, y, width, height, 
-                        image_path, frame_width, frame_height, session_id):
+
+    # ------------------------------------------------------------------
+    # High-level helpers (same interface as before)
+    # ------------------------------------------------------------------
+    def insert_detection(self, timestamp, object_class, confidence, x, y, width, height,
+                         image_path, frame_width, frame_height, session_id):
         """Insert detection record"""
         query = """
-            INSERT INTO detections (timestamp, object_class, confidence, x, y, width, height, 
-                                  image_path, frame_width, frame_height, session_id)
+            INSERT INTO detections (timestamp, object_class, confidence, x, y, width, height,
+                                   image_path, frame_width, frame_height, session_id)
             VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
         """
-        params = (timestamp, object_class, confidence, x, y, width, height, 
-                 image_path, frame_width, frame_height, session_id)
+        params = (str(timestamp), object_class, confidence, x, y, width, height,
+                  image_path, frame_width, frame_height, session_id)
         return self.execute_query(query, params)
-    
-    def insert_performance_metric(self, timestamp, fps, inference_time, accuracy, 
-                                objects_detected, session_id):
+
+    def insert_performance_metric(self, timestamp, fps, inference_time, accuracy,
+                                  objects_detected, session_id):
         """Insert performance metric record"""
         query = """
-            INSERT INTO performance_metrics (timestamp, fps, inference_time, accuracy, 
-                                           objects_detected, session_id)
+            INSERT INTO performance_metrics (timestamp, fps, inference_time, accuracy,
+                                            objects_detected, session_id)
             VALUES (%s, %s, %s, %s, %s, %s)
         """
-        params = (timestamp, fps, inference_time, accuracy, objects_detected, session_id)
+        params = (str(timestamp), fps, inference_time, accuracy, objects_detected, session_id)
         return self.execute_query(query, params)
-    
-    def insert_inventory(self, timestamp, object_class, count, avg_confidence, 
-                        avg_x, avg_y, session_id):
+
+    def insert_inventory(self, timestamp, object_class, count, avg_confidence,
+                         avg_x, avg_y, session_id):
         """Insert inventory record"""
         query = """
-            INSERT INTO inventory (timestamp, object_class, count, avg_confidence, 
-                                 avg_x, avg_y, session_id)
+            INSERT INTO inventory (timestamp, object_class, count, avg_confidence,
+                                  avg_x, avg_y, session_id)
             VALUES (%s, %s, %s, %s, %s, %s, %s)
         """
-        params = (timestamp, object_class, count, avg_confidence, avg_x, avg_y, session_id)
+        params = (str(timestamp), object_class, count, avg_confidence, avg_x, avg_y, session_id)
         return self.execute_query(query, params)
-    
+
     def create_session(self, session_id, start_time):
         """Create a new session record"""
         query = """
             INSERT INTO sessions (session_id, start_time, status)
             VALUES (%s, %s, 'active')
         """
-        params = (session_id, start_time)
-        return self.execute_query(query, params)
-    
+        return self.execute_query(query, (session_id, str(start_time)))
+
     def update_session(self, session_id, end_time, duration, objects_detected, status):
         """Update session record"""
         query = """
-            UPDATE sessions 
+            UPDATE sessions
             SET end_time = %s, duration = %s, objects_detected = %s, status = %s
             WHERE session_id = %s
         """
-        params = (end_time, duration, objects_detected, status, session_id)
-        return self.execute_query(query, params)
-    
+        return self.execute_query(query, (str(end_time), duration, objects_detected, status, session_id))
+
     def get_recent_detections(self, limit=500):
         """Get recent detection records"""
         query = """
-            SELECT timestamp, object_class, confidence, x, y, width, height, image_path 
-            FROM detections 
-            ORDER BY timestamp DESC 
+            SELECT timestamp, object_class, confidence, x, y, width, height, image_path
+            FROM detections
+            ORDER BY timestamp DESC
             LIMIT %s
         """
         return self.execute_query(query, (limit,), fetch=True)
-    
+
     def get_performance_metrics(self, days=3):
         """Get performance metrics for specified days"""
         query = """
             SELECT timestamp, fps, inference_time, objects_detected
-            FROM performance_metrics 
+            FROM performance_metrics
             WHERE timestamp >= DATE_SUB(NOW(), INTERVAL %s DAY)
             ORDER BY timestamp
         """
         return self.execute_query(query, (days,), fetch=True)
-    
+
     def get_inventory_trends(self, days=30):
         """Get inventory trends for specified days"""
         query = """
-            SELECT DATE(timestamp) as date, object_class, 
+            SELECT DATE(timestamp) as date, object_class,
                    AVG(count) as avg_count, AVG(avg_confidence) as avg_conf
             FROM inventory
             WHERE timestamp >= DATE_SUB(NOW(), INTERVAL %s DAY)
@@ -154,7 +284,7 @@ class DatabaseManager:
             ORDER BY date
         """
         return self.execute_query(query, (days,), fetch=True)
-    
+
     def get_inventory_stats(self, days=7):
         """Get inventory statistics for specified days"""
         query = """
@@ -169,14 +299,14 @@ class DatabaseManager:
             GROUP BY object_class
         """
         return self.execute_query(query, (days,), fetch=True)
-    
+
     def get_detection_patterns(self, days=7):
         """Get detection patterns for specified days"""
         query = """
-            SELECT DATE_FORMAT(timestamp, '%%Y-%%m-%%d %%H:00') as hour, 
-                   object_class, 
+            SELECT DATE_FORMAT(timestamp, '%%Y-%%m-%%d %%H:00') as hour,
+                   object_class,
                    COUNT(*) as count
-            FROM detections 
+            FROM detections
             WHERE timestamp >= DATE_SUB(NOW(), INTERVAL %s DAY)
             GROUP BY DATE_FORMAT(timestamp, '%%Y-%%m-%%d %%H'), object_class
             ORDER BY hour
@@ -187,14 +317,14 @@ class SpaceStationDetectionApp:
     def __init__(self, root):
         self.root = root
         self.root.title("Space Station Object Detection System v3.0")
-        self.root.geometry("1600x1000")
+        self.root.geometry("1200x800")
         self.root.configure(bg='#1a1a2e')
         
-        # Initialize database
+        # Initialize database (tries MySQL first, falls back to SQLite automatically)
         self.db = DatabaseManager()
         if not self.db.connect():
-            messagebox.showerror("Database Error", "Could not connect to MySQL database")
-            return
+            print("Database unavailable - running without persistence")
+            # Continue anyway; features that need DB will silently skip
         
         # Generate session ID
         self.session_id = str(uuid.uuid4())
@@ -249,7 +379,7 @@ class SpaceStationDetectionApp:
         header_frame.pack(fill='x', padx=10, pady=5)
         header_frame.pack_propagate(False)
         
-        title_label = tk.Label(header_frame, text="🚀 SPACE STATION OBJECT DETECTION SYSTEM v3.0", 
+        title_label = tk.Label(header_frame, text="SPACE STATION OBJECT DETECTION SYSTEM v3.0", 
                               font=('Arial', 18, 'bold'), fg='#4fc3f7', bg='#16213e')
         title_label.pack(pady=10)
         
@@ -334,11 +464,11 @@ class SpaceStationDetectionApp:
         video_controls_frame.pack(fill='x', padx=5, pady=2)
         video_controls_frame.pack_propagate(False)
         
-        self.play_button = tk.Button(video_controls_frame, text="▶ Play", command=self.toggle_video_playback,
+        self.play_button = tk.Button(video_controls_frame, text="Play", command=self.toggle_video_playback,
                                     bg='#4fc3f7', fg='black', font=('Arial', 10, 'bold'), state='disabled')
         self.play_button.pack(side='left', padx=5, pady=5)
         
-        self.stop_button = tk.Button(video_controls_frame, text="⏹ Stop", command=self.stop_video,
+        self.stop_button = tk.Button(video_controls_frame, text="Stop", command=self.stop_video,
                                     bg='#f44336', fg='white', font=('Arial', 10, 'bold'), state='disabled')
         self.stop_button.pack(side='left', padx=5, pady=5)
         
@@ -679,7 +809,7 @@ class SpaceStationDetectionApp:
             
             # Critical equipment with minimum required counts
             critical_equipment = {
-                "Oxygen Tank": {"min": 2, "warning": "⚠ Low"},
+                "Oxygen Tank": {"min": 2, "warning": "Low"},
                 "Fire Extinguisher": {"min": 1, "critical": True},
                 "Toolbox": {"min": 1},
             }
@@ -709,9 +839,13 @@ class SpaceStationDetectionApp:
             
             # Add data to treeview with enhanced database query
             try:
-                for item, config in critical_equipment.items():
+                # Get all items from current inventory PLUS critical items
+                all_items = set(self.inventory_counts.keys()) | set(critical_equipment.keys())
+                
+                for item in sorted(all_items):
+                    config = critical_equipment.get(item, {})
                     count = self.inventory_counts.get(item, 0)
-                    min_required = config.get("min", 1)
+                    min_required = config.get("min", 0) # Default to 0 for non-critical
                     
                     # Get detailed info from database
                     query = """
@@ -725,7 +859,9 @@ class SpaceStationDetectionApp:
                     
                     # Format values
                     if result:
-                        last_seen = result[0]['timestamp'].strftime('%Y-%m-%d %H:%M:%S')
+                        last_seen = result[0]['timestamp']
+                        if isinstance(last_seen, datetime):
+                            last_seen = last_seen.strftime('%Y-%m-%d %H:%M:%S')
                         location = f"({result[0]['avg_x']:.1f}, {result[0]['avg_y']:.1f})"
                         confidence = f"{result[0]['avg_confidence']:.1%}" if result[0]['avg_confidence'] else "N/A"
                     else:
@@ -733,22 +869,26 @@ class SpaceStationDetectionApp:
                         location = "Unknown"
                         confidence = "N/A"
                     
-                    # Determine status with more sophisticated logic
+                    # Determine status
                     status_tags = []
-                    if count == 0 and config.get("critical", False):
-                        status = "❌ CRITICAL"
-                        status_tags = ['critical']
-                    elif count < min_required:
-                        status = "⚠ Low"
-                        status_tags = ['warning']
+                    if item in critical_equipment:
+                        if count == 0 and config.get("critical", False):
+                            status = "CRITICAL"
+                            status_tags = ['critical']
+                        elif count < min_required:
+                            status = "Low"
+                            status_tags = ['warning']
+                        else:
+                            status = "OK"
+                            status_tags = ['ok']
                     else:
-                        status = "✔ OK"
+                        status = "Detected"
                         status_tags = ['ok']
                     
                     tree.insert('', 'end', values=(
                         item, 
                         count,
-                        min_required,
+                        min_required if min_required > 0 else "-",
                         f"{last_seen}\n(Conf: {confidence})",
                         location,
                         status
@@ -764,7 +904,7 @@ class SpaceStationDetectionApp:
             button_frame.pack(fill='x', padx=10, pady=5)
             
             tk.Button(button_frame, text="Refresh Inventory", 
-                     command=self.refresh_inventory_data,
+                     command=lambda: self.refresh_inventory_data(tree),
                      bg='#4fc3f7', fg='black').pack(side=tk.LEFT, padx=5)
             
             tk.Button(button_frame, text="Placement Recommendations", 
@@ -895,10 +1035,66 @@ class SpaceStationDetectionApp:
         except Exception as e:
             messagebox.showerror("Error", f"Failed to create dashboard: {str(e)}")
     
-    def refresh_inventory_data(self):
+    def refresh_inventory_data(self, tree=None):
         """Refresh inventory data from database"""
         try:
-            # This would typically refresh the current display
+            if tree:
+                # Clear current data
+                for item in tree.get_children():
+                    tree.delete(item)
+                
+                # Critical equipment config (re-define or pass in)
+                critical_equipment = {
+                    "Oxygen Tank": {"min": 2, "warning": "Low"},
+                    "Fire Extinguisher": {"min": 1, "critical": True},
+                    "Toolbox": {"min": 1},
+                }
+                
+                # Re-add data (similar logic to show_inventory_dashboard)
+                all_items = set(self.inventory_counts.keys()) | set(critical_equipment.keys())
+                for item in sorted(all_items):
+                    config = critical_equipment.get(item, {})
+                    count = self.inventory_counts.get(item, 0)
+                    min_required = config.get("min", 0)
+                    
+                    query = "SELECT timestamp, avg_x, avg_y, avg_confidence FROM inventory WHERE object_class = ? ORDER BY timestamp DESC LIMIT 1"
+                    result = self.db.execute_query(query, (item,), fetch=True)
+                    
+                    if result:
+                        last_seen = result[0]['timestamp']
+                        if isinstance(last_seen, datetime):
+                            last_seen = last_seen.strftime('%Y-%m-%d %H:%M:%S')
+                        location = f"({result[0]['avg_x']:.1f}, {result[0]['avg_y']:.1f})"
+                        confidence = f"{result[0]['avg_confidence']:.1%}" if result[0]['avg_confidence'] else "N/A"
+                    else:
+                        last_seen = "Never"
+                        location = "Unknown"
+                        confidence = "N/A"
+                    
+                    status_tags = []
+                    if item in critical_equipment:
+                        if count == 0 and config.get("critical", False):
+                            status = "CRITICAL"
+                            status_tags = ['critical']
+                        elif count < min_required:
+                            status = "Low"
+                            status_tags = ['warning']
+                        else:
+                            status = "OK"
+                            status_tags = ['ok']
+                    else:
+                        status = "Detected"
+                        status_tags = ['ok']
+                    
+                    tree.insert('', 'end', values=(
+                        item, 
+                        count,
+                        min_required if min_required > 0 else "-",
+                        f"{last_seen}\n(Conf: {confidence})",
+                        location,
+                        status
+                    ), tags=status_tags)
+                
             messagebox.showinfo("Refresh", "Inventory data refreshed successfully!")
         except Exception as e:
             messagebox.showerror("Error", f"Failed to refresh inventory: {str(e)}")
@@ -1360,10 +1556,10 @@ class SpaceStationDetectionApp:
         
         if self.is_video_playing:
             self.is_video_playing = False
-            self.play_button.config(text="▶ Play")
+            self.play_button.config(text="Play")
         else:
             self.is_video_playing = True
-            self.play_button.config(text="⏸ Pause")
+            self.play_button.config(text="Pause")
             self.play_video()
     
     def play_video(self):
@@ -1380,7 +1576,7 @@ class SpaceStationDetectionApp:
                     # End of video
                     self.is_video_playing = False
                     self.video_capture.set(cv2.CAP_PROP_POS_FRAMES, 0)  # Rewind
-                    self.root.after(0, lambda: self.play_button.config(text="▶ Play"))
+                    self.root.after(0, lambda: self.play_button.config(text="Play"))
                     break
                 
                 self.current_frame = frame
@@ -1408,7 +1604,7 @@ class SpaceStationDetectionApp:
     def stop_video(self):
         """Stop video playback"""
         self.is_video_playing = False
-        self.play_button.config(text="▶ Play")
+        self.play_button.config(text="Play")
         
         if self.video_capture:
             self.video_capture.set(cv2.CAP_PROP_POS_FRAMES, 0)  # Rewind
@@ -1448,7 +1644,7 @@ class SpaceStationDetectionApp:
                 
                 # Show camera feed
                 self.is_video_playing = False
-                self.play_button.config(text="▶ Play")
+                self.play_button.config(text="Play")
                 self.play_video()  # Start camera feed without processing
                 
             except Exception as e:
